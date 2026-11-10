@@ -1,189 +1,427 @@
+// LOCAL CHANGE: provenance
+// Built on Omarchy's battery panel: /usr/share/omarchy/shell/plugins/panels/power/Panel.qml
+// from omarchy 4.0.0.r7637.g29f3bb6 (sha256 145cd9632d8caa3a9b390b27cb6e7382b2ccb83610ae4bda04a2755c52a75068).
+// Every edit to the copied code sits between LOCAL CHANGE / END LOCAL CHANGE
+// markers, so a re-sync is a fresh copy plus these hunks. Copied code: MIT,
+// see LICENSE.MIT. `bin/battery-insights stock-check` says when Omarchy's
+// file has changed.
+// END LOCAL CHANGE
 import QtQuick
 import Quickshell
 import Quickshell.Io
 import Quickshell.Services.UPower
 import qs.Commons
+import qs.Commons as Commons
 import qs.Ui
-import "Model.js" as Model
+// LOCAL CHANGE: the stock model is vendored as PowerModel.js (Model.js is the
+// history model); UiState.js reads and writes the HISTORY section's choice.
+import "PowerModel.js" as Model
+import "UiState.js" as UiState
+// END LOCAL CHANGE
 
-// Bar button plus the Battery Insights panel: battery level and usage for
-// the last 24 hours, 7 days or 30 days, and battery health over its life.
-// Data comes from the log Service.qml keeps; this side only reads it.
 Panel {
   id: root
-  moduleName: "aabulkhairov.battery-insights"
-  ipcTarget: "aabulkhairov.battery-insights"
-  // The panel owns its IpcHandler so it can add `range` to the stock verbs.
+  moduleName: "omarchy.power"
+  ipcTarget: "omarchy.power"
+  // manageIpc: false so this panel can own the single IpcHandler the target
+  // permits — needed for the togglePercentage method below.
   manageIpc: false
-
+  property var batteryInfo: ({})
+  property var systemInfo: ({})
+  property var profiles: []
+  property string activeProfile: ""
+  property int profileIndex: 0
+  property bool cursorActive: false
+  // LOCAL CHANGE: HISTORY section state. The choice lives in the plugin's
+  // state directory (ui.json), not shell.json, and every bar's copy of this
+  // widget watches the same file, so a pick on one monitor shows on all.
   readonly property string stateDir: (Quickshell.env("XDG_STATE_HOME") || (Quickshell.env("HOME") + "/.local/state")) + "/battery-insights"
   readonly property string helper: decodeURIComponent(Qt.resolvedUrl("bin/battery-insights").toString().replace(/^file:\/\//, ""))
-
-  readonly property var rangeOptions: [
-    { value: "24h", label: "24 hours" },
-    { value: "7d", label: "7 days" },
-    { value: "30d", label: "30 days" }
-  ]
+  property string graph: "level"
   property string range: "24h"
-  property var samples: []
-  property var healthRows: []
-  property var info: ({})
-  property var report: null
-  property var health: null
+  property bool stateDirReady: false
+  property bool uiStateWritePending: false
 
-  readonly property bool showRate: setting("showRate", false) === true
-
-  // ---- live readings for the bar button and hero
-  readonly property var device: UPower.displayDevice
-  readonly property bool batteryPresent: !!(device && device.isPresent)
-  readonly property real percent: batteryPresent ? Math.max(0, Math.min(1, device.percentage)) * 100 : 0
-  readonly property bool onBattery: batteryPresent && UPower.onBattery
-  readonly property bool charging: batteryPresent && device.state === UPowerDeviceState.Charging
-  readonly property real rateW: batteryPresent ? Math.abs(Number(device.changeRate) || 0) : 0
-  readonly property bool showRateNow: showRate && onBattery && rateW > 0 && !vertical
-  readonly property bool vertical: bar ? bar.vertical : false
-
-  readonly property string statusText: {
-    if (!batteryPresent) return "No battery"
-    if (onBattery) {
-      var left = device.timeToEmpty > 0 ? " · " + Model.formatDuration(device.timeToEmpty) + " left" : ""
-      return "On battery · " + rateW.toFixed(1) + " W" + left
-    }
-    if (charging) {
-      var full = device.timeToFull > 0 ? " · " + Model.formatDuration(device.timeToFull) + " to full" : ""
-      return "Charging · " + rateW.toFixed(1) + " W" + full
-    }
-    if (device.state === UPowerDeviceState.FullyCharged) return "Fully charged"
-    return "Plugged in · not charging"
-  }
-
-  function service() {
-    return bar && bar.shell && typeof bar.shell.serviceFor === "function" ? bar.shell.serviceFor(moduleName) : null
-  }
-
-  function rebuild() {
-    var now = Math.floor(Date.now() / 1000)
-    report = Model.buildReport(samples, range, now)
-    health = Model.healthReport(info, healthRows, now)
+  function setGraph(value) {
+    if (!UiState.isGraph(value) || value === graph) return
+    graph = value
+    writeUiState()
   }
 
   function setRange(value) {
-    if (value === range) return
+    if (!UiState.isRange(value) || value === range) return
     range = value
-    rebuild()
+    writeUiState()
   }
 
-  function stepRange(delta) {
-    var i = 0
-    for (var k = 0; k < rangeOptions.length; k++) if (rangeOptions[k].value === range) i = k
-    setRange(rangeOptions[(i + delta + rangeOptions.length) % rangeOptions.length].value)
+  function writeUiState() {
+    // The state directory may not exist yet on a fresh install (the logger
+    // creates it on its first reading); hold the write until mkdir is done.
+    if (!stateDirReady) {
+      uiStateWritePending = true
+      if (!stateDirProc.running) stateDirProc.running = true
+      return
+    }
+    uiStateFile.setText(UiState.serialize({ graph: graph, range: range }))
+  }
+
+  function applyUiState(text) {
+    // Never writes: the write this read may be answering would otherwise echo
+    // between the bar copies on each monitor.
+    var s = UiState.parse(text)
+    graph = s.graph
+    range = s.range
+  }
+
+  function stateSnapshot() {
+    return {
+      opened: root.opened,
+      graph: root.graph,
+      range: root.range,
+      batteryPresent: root.batteryPresent,
+      showPercentage: root.showPercentage,
+      profiles: root.profiles,
+      activeProfile: root.activeProfile,
+      profileIndex: root.profileIndex,
+      cursorActive: root.cursorActive,
+      // Keys sent before the panel's key catcher has focus are lost; the
+      // e2e test waits for this before pressing any.
+      keyFocus: !!(panel.loadedContent && panel.loadedContent.activeFocus),
+      picker: panel.loadedContent && panel.loadedContent.history ? panel.loadedContent.history.picker : "none",
+      historySamples: panel.loadedContent && panel.loadedContent.history ? panel.loadedContent.history.samples.length : -1,
+      // Which bar's copy answered: every monitor has one, and IPC reaches
+      // only the first.
+      screen: button.QsWindow.window && button.QsWindow.window.screen ? button.QsWindow.window.screen.name : "",
+      // The card is capped to the screen; on a short one the content is
+      // taller and scrolls.
+      contentHeight: panel.loadedContentHeight,
+      cardHeight: panel.contentHeight,
+      scrollY: panel.loadedContent && panel.loadedContent.scrollY !== undefined ? panel.loadedContent.scrollY : 0
+    }
+  }
+
+  FileView {
+    id: uiStateFile
+    path: root.stateDir + "/ui.json"
+    printErrors: false
+    watchChanges: true
+    atomicWrites: true
+    onFileChanged: reload()
+    onLoaded: root.applyUiState(text())
+  }
+
+  Process {
+    id: stateDirProc
+    command: ["mkdir", "-p", root.stateDir]
+    onExited: function(exitCode) {
+      root.stateDirReady = exitCode === 0
+      if (!root.stateDirReady) return
+      // A FileView created while its directory was missing never watches
+      // the file, even after the directory appears (Quickshell 0.3), so picks
+      // from another monitor's copy would never arrive. Reloading once the
+      // directory exists arms the watch.
+      uiStateFile.reload()
+      if (root.uiStateWritePending) {
+        root.uiStateWritePending = false
+        root.writeUiState()
+      }
+    }
+  }
+
+  // Every copy makes sure the state directory exists as it starts, so its
+  // ui.json watch is armed before the first pick on any monitor.
+  Component.onCompleted: stateDirProc.running = true
+  // END LOCAL CHANGE
+  readonly property bool showPercentage: setting("showPercentage", false) === true
+  // With the percentage shown the button paints a text block wider than an
+  // icon, so the open-panel mark takes the painted width instead of the
+  // icon-sized fraction of the slot the fallback assumes.
+  readonly property real openPanelIndicatorWidth: showPercentage && !button.vertical ? button.glyphPaintedWidth : 0
+  readonly property bool batteryPresent: {
+    var device = UPower.displayDevice
+    return !!(device && device.isPresent)
+  }
+
+  function upowerStates() {
+    return {
+      Charging: UPowerDeviceState.Charging,
+      Discharging: UPowerDeviceState.Discharging,
+      FullyCharged: UPowerDeviceState.FullyCharged,
+      PendingCharge: UPowerDeviceState.PendingCharge
+    }
+  }
+
+  function selectProfileByDelta(delta) {
+    profileIndex = Model.selectProfileIndex(profileIndex, delta, profiles)
+  }
+
+  function activateSelectedProfile() {
+    if (profileIndex < 0 || profileIndex >= profiles.length) return
+    setProfile(profiles[profileIndex])
+  }
+
+  function batteryIcon() {
+    var device = UPower.displayDevice
+    return Model.batteryIcon(device, root.discharging, upowerStates())
+  }
+
+  function modeLabel() {
+    var device = UPower.displayDevice
+    return Model.modeLabel(device, root.discharging, upowerStates(), Commons.I18n.t)
+  }
+
+  function profileIcon(name) {
+    return Model.profileIcon(name)
+  }
+
+  readonly property bool fullyCharged: {
+    var device = UPower.displayDevice
+    return device && device.isPresent && device.state === UPowerDeviceState.FullyCharged && !root.chargeThresholdActive
+  }
+  readonly property bool discharging: {
+    var device = UPower.displayDevice
+    return !!(device && device.isPresent && UPower.onBattery)
+  }
+  readonly property bool chargeThresholdActive: {
+    var device = UPower.displayDevice
+    return Model.chargeThresholdActive(device, root.discharging, upowerStates())
+  }
+  readonly property bool batteryFull: fullyCharged || (!root.discharging && batteryFraction >= 1)
+  readonly property bool batteryFlowIdle: batteryFull || chargeThresholdActive
+
+  // 0..1 charge level, used by the visual progress bar.
+  readonly property real batteryFraction: {
+    var d = UPower.displayDevice
+    return Model.batteryFraction(d)
+  }
+
+  readonly property bool charging: {
+    var d = UPower.displayDevice
+    return d && d.isPresent && !UPower.onBattery && !root.batteryFlowIdle
+  }
+
+  readonly property color batteryFillColor: {
+    return root.bar ? root.bar.foreground : Commons.Color.foreground
+  }
+
+  // Cute agent-flavored phrases shown in the hero status line, rotated on a
+  // timer so the panel feels alive when current is flowing (either direction).
+  readonly property var chargingPhrases: [
+    Commons.I18n.t("power.chargingPhrase1"),
+    Commons.I18n.t("power.chargingPhrase2"),
+    Commons.I18n.t("power.chargingPhrase3"),
+    Commons.I18n.t("power.chargingPhrase4"),
+    Commons.I18n.t("power.chargingPhrase5"),
+    Commons.I18n.t("power.chargingPhrase6"),
+    Commons.I18n.t("power.chargingPhrase7"),
+    Commons.I18n.t("power.chargingPhrase8"),
+    Commons.I18n.t("power.chargingPhrase9")
+  ]
+  readonly property var onBatteryPhrases: [
+    Commons.I18n.t("power.dischargingPhrase1"),
+    Commons.I18n.t("power.dischargingPhrase2"),
+    Commons.I18n.t("power.dischargingPhrase3"),
+    Commons.I18n.t("power.dischargingPhrase4"),
+    Commons.I18n.t("power.dischargingPhrase5"),
+    Commons.I18n.t("power.dischargingPhrase6"),
+    Commons.I18n.t("power.dischargingPhrase7"),
+    Commons.I18n.t("power.dischargingPhrase8"),
+    Commons.I18n.t("power.dischargingPhrase9")
+  ]
+  property int phraseIndex: 0
+
+  // Whichever list is "active" given the current power state.
+  readonly property var activePhrases: {
+    if (fullyCharged) return []
+    if (charging) return chargingPhrases
+    if (discharging) return onBatteryPhrases
+    return []
+  }
+  readonly property bool rotatingPhrases: activePhrases.length > 0
+
+  // The battery script's readings in the current language's digits; the
+  // time field already comes translated, so it is shown as it arrives.
+  function reading(raw) {
+    return Model.localizeReading(raw, Commons.I18n.formatNumber)
+  }
+
+  readonly property string heroStatusText: {
+    if (fullyCharged) return Commons.I18n.t("power.fullyCharged")
+    if (rotatingPhrases) return activePhrases[phraseIndex % activePhrases.length]
+    return modeLabel()
   }
 
   function refresh() {
-    samplesFile.reload()
-    healthFile.reload()
-    if (!infoProc.running) infoProc.running = true
-    var s = service()
-    if (s && s.sampleNow) s.sampleNow()
+    if (!batteryPresent) return
+
+    if (!batteryProc.running) batteryProc.running = true
+    if (!profilesProc.running) profilesProc.running = true
+    if (!systemProc.running) systemProc.running = true
   }
 
-  function toggleRate() {
-    root.settings = Object.assign({}, root.settings, { showRate: !root.showRate })
+  function updateKeyValue(raw, targetName) {
+    var next = Model.parseKeyValue(raw)
+    // Keep last known good data if a refresh briefly returns nothing — happens
+    // around AC plug/unplug events. Avoids the section collapsing mid-transition.
+    if (Object.keys(next).length === 0) return
+    if (targetName === "battery") batteryInfo = next
+    else systemInfo = next
+  }
+
+  function updateProfiles(raw) {
+    var parsed = Model.parseProfiles(raw, profileIndex)
+    // Same guard as battery: preserve the last known profile list across
+    // transient empty payloads so the buttons don't blink out.
+    if (parsed.profiles.length === 0) return
+    profiles = parsed.profiles
+    activeProfile = parsed.activeProfile
+    profileIndex = parsed.profileIndex
+    if (opened && !cursorActive) {
+      var idx = profiles.indexOf(activeProfile)
+      if (idx >= 0) profileIndex = idx
+    }
+  }
+
+  function setProfile(profile) {
+    if (!profile || actionProc.running) return
+    actionProc.command = ["omarchy-powerprofiles-set", root.discharging ? "battery" : "ac", profile]
+    actionProc.running = true
+  }
+
+  function togglePercentage() {
+    root.settings = Object.assign({}, root.settings, { showPercentage: !root.showPercentage })
     if (root.bar && root.bar.shell) root.bar.shell.updateEntryInline(root.moduleName, root.settings)
   }
 
-  // omarchy-shell aabulkhairov.battery-insights <open|close|toggle|range 7d>
-  IpcHandler {
-    target: root.ipcTarget
+  ShellIpc {
+    target: "omarchy.power"
 
-    function open(): void { root.open() }
-    function close(): void { root.close() }
-    function show(): void { root.open() }
-    function hide(): void { root.close() }
-    function toggle(): void { root.toggle() }
+    function open() { root.open() }
+    function close() { root.close() }
+    function show() { root.open() }
+    function hide() { root.close() }
+    function toggle() { root.toggle() }
+    function togglePercentage() { root.togglePercentage() }
+    // LOCAL CHANGE: pick the HISTORY graph or range from a script or keybind
+    // (both open the panel), and report state for the e2e tests.
     function range(value: string): void {
-      if (Model.RANGES[value]) root.setRange(value)
+      if (UiState.isRange(value)) root.setRange(value)
       root.open()
     }
+    function graph(value: string): void {
+      if (UiState.isGraph(value)) root.setGraph(value)
+      root.open()
+    }
+    function state(): string { return JSON.stringify(root.stateSnapshot()) }
+    // END LOCAL CHANGE
   }
 
   onOpenedChanged: {
     if (opened) {
+      if (!batteryPresent) {
+        // Deferred: closing here writes the very property whose change
+        // is being notified, which QML reports as a binding loop for
+        // Panel.opened on every open attempt without a battery.
+        Qt.callLater(function() { root.close() })
+        return
+      }
+
       refresh()
-    } else {
-      // A month of minute readings is a few MB once parsed; only hold it
-      // while the panel is up.
-      samples = []
+      var idx = profiles.indexOf(activeProfile)
+      profileIndex = idx >= 0 ? idx : 0
+      cursorActive = false
     }
   }
+
+  onBatteryPresentChanged: if (!batteryPresent) close()
 
   visible: batteryPresent
   implicitWidth: batteryPresent ? button.implicitWidth : 0
   implicitHeight: batteryPresent ? button.implicitHeight : 0
 
-  FileView {
-    id: samplesFile
-    path: root.opened ? root.stateDir + "/samples.csv" : ""
-    printErrors: false
-    watchChanges: true
-    onFileChanged: reload()
-    onLoaded: { root.samples = Model.parseSamples(text()); root.rebuild() }
-    onLoadFailed: { root.samples = []; root.rebuild() }
-  }
-
-  FileView {
-    id: healthFile
-    path: root.opened ? root.stateDir + "/health.csv" : ""
-    printErrors: false
-    watchChanges: true
-    onFileChanged: reload()
-    onLoaded: { root.healthRows = Model.parseHealth(text()); root.rebuild() }
-    onLoadFailed: { root.healthRows = []; root.rebuild() }
-  }
-
-  // Charging draws in the theme's green, as macOS draws it, falling back to
-  // the accent for themes without one.
-  property color chargeColor: Color.accent
-
-  FileView {
-    path: Color.currentThemePath + "/colors.toml"
-    printErrors: false
-    watchChanges: true
-    onFileChanged: reload()
-    onLoaded: {
-      var m = /^\s*(?:green|color2)\s*=\s*"(#[0-9a-fA-F]{6,8})"/m.exec(text())
-      root.chargeColor = m ? m[1] : Color.accent
-    }
+  Process {
+    id: batteryProc
+    command: ["omarchy-battery-status", "--shell"]
+    stdout: StdioCollector { waitForEnd: true; onStreamFinished: root.updateKeyValue(text, "battery") }
   }
 
   Process {
-    id: infoProc
-    command: ["bash", root.helper, "info"]
-    stdout: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: { root.info = Model.parseInfo(text); root.rebuild() }
+    id: profilesProc
+    command: ["omarchy-powerprofiles-list", "--active-state"]
+    stdout: StdioCollector { waitForEnd: true; onStreamFinished: root.updateProfiles(text) }
+  }
+
+  Process {
+    id: systemProc
+    command: ["omarchy-system-stats"]
+    stdout: StdioCollector { waitForEnd: true; onStreamFinished: root.updateKeyValue(text, "system") }
+  }
+
+  Process {
+    id: actionProc
+    onExited: root.refresh()
+  }
+
+  Timer { interval: 5000; running: root.opened; repeat: true; onTriggered: root.refresh() }
+
+  // Rotate the status phrase while the panel is open and we're in a
+  // rotating state (charging or on battery). The text swap is wrapped in a
+  // fade so the changeover reads as one organism rather than a hard cut.
+  Timer {
+    id: phraseTimer
+    interval: 2800
+    running: root.opened && root.rotatingPhrases
+    repeat: true
+    triggeredOnStart: false
+    onTriggered: phraseSwap.restart()
+  }
+
+  SequentialAnimation {
+    id: phraseSwap
+    PropertyAnimation {
+      target: panel.loadedContent ? panel.loadedContent.heroStatus : null; property: "opacity"
+      to: 0.0; duration: Style.duration(150); easing.type: Easing.OutCubic
+    }
+    ScriptAction {
+      script: {
+        var n = root.activePhrases.length
+        if (n > 0) root.phraseIndex = (root.phraseIndex + 1) % n
+      }
+    }
+    PropertyAnimation {
+      target: panel.loadedContent ? panel.loadedContent.heroStatus : null; property: "opacity"
+      to: 1.0; duration: Style.duration(200); easing.type: Easing.OutCubic
     }
   }
 
-  // Keep "now" moving while the panel stays open.
-  Timer {
-    interval: 60000
-    running: root.opened
-    repeat: true
-    onTriggered: root.rebuild()
+  // If we leave a rotating state mid-swap, halt the animation and snap back
+  // to full opacity so "FULLY CHARGED" is legible immediately rather than
+  // appearing dimmed.
+  Connections {
+    target: root
+    function onRotatingPhrasesChanged() {
+      if (!root.rotatingPhrases) {
+        phraseSwap.stop()
+        if (panel.loadedContent) panel.loadedContent.heroStatus.opacity = 1.0
+      }
+    }
   }
 
   BarIconButton {
     id: button
     anchors.fill: parent
     bar: root.bar
-    text: root.showRateNow ? root.rateW.toFixed(1) + "W 󰄪" : "󰄪"
-    slotSize: Style.bar.iconSlot * (root.showRateNow ? 2.6 : 1)
+    text: root.batteryIcon()
+    labelText: root.showPercentage && !vertical ? Commons.I18n.formatNumber(Math.round(root.batteryFraction * 100)) + "%" : ""
+    slotSize: Style.bar.iconSlot * (root.showPercentage && !vertical ? 2 : 1)
     tooltipText: ""
     onPressed: function(b) {
-      if (b === Qt.RightButton) root.toggleRate()
-      else if (b === Qt.MiddleButton) root.refresh()
-      else root.toggle()
+      if (!root.batteryPresent) return
+      // LOCAL CHANGE: only a left click does anything; right (stock: toggle
+      // the percentage label) and middle click are deliberately inert. The
+      // label still follows showPercentage and the togglePercentage IPC verb.
+      if (b === Qt.LeftButton) root.toggle()
+      // END LOCAL CHANGE
     }
   }
 
@@ -193,406 +431,306 @@ Panel {
     owner: root
     bar: root.bar
     open: root.opened && root.batteryPresent
-    focusTarget: keyCatcher
-    contentWidth: panel.fittedContentWidth(Style.space(460))
-    contentHeight: panel.fittedContentHeight(column.implicitHeight)
+    focusTarget: panel.loadedContent
+    // LOCAL CHANGE: 420 instead of stock 380, so the HISTORY section's
+    // two-column stats ("Full charge lasts ~18h 0m", "Reaches 80% in ~5.5
+    // years") fit without being cut off.
+    contentWidth: panel.fittedContentWidth(Style.space(420))
+    // END LOCAL CHANGE
+    contentHeight: panel.fittedContentHeight(panel.loadedContentHeight)
 
-    PanelKeyCatcher {
+    content: PanelKeyCatcher {
       id: keyCatcher
+      property alias heroStatus: heroStatus
+      // LOCAL CHANGE: let the widget reach the HISTORY section and the scroll
+      // position (state()).
+      property alias history: history
+      property alias scrollY: scroller.contentY
+      // END LOCAL CHANGE
       anchors.fill: parent
+      implicitHeight: column.implicitHeight
       onMoveRequested: function(dx, dy) {
-        if (dx !== 0) root.stepRange(dx)
-        else scroll.contentY = Math.max(0, Math.min(scroll.contentHeight - scroll.height, scroll.contentY + dy * Style.space(60)))
+        if (!root.cursorActive) { root.cursorActive = true; return }
+        if (dx !== 0) root.selectProfileByDelta(dx)
+        else if (dy !== 0) root.selectProfileByDelta(dy)
       }
+      onActivateRequested: if (root.cursorActive) root.activateSelectedProfile()
       onCloseRequested: root.close()
       onTabRequested: function(direction) { root.switchPanel(direction) }
-      onTextKey: function(t) {
-        if (t === "1") root.setRange("24h")
-        else if (t === "2") root.setRange("7d")
-        else if (t === "3") root.setRange("30d")
-        else if (t === "r") root.refresh()
-      }
 
+      // LOCAL CHANGE: with the HISTORY section the panel can be taller than a
+      // short screen allows. The card is capped to the screen, so the content
+      // scrolls inside it, and the power profiles (at the bottom) scroll into
+      // view when the keyboard or mouse cursor reaches them. Stock code below
+      // is not re-indented, to keep the diff against stock small.
       Flickable {
-        id: scroll
+        id: scroller
         anchors.fill: parent
         contentWidth: width
         contentHeight: column.implicitHeight
         clip: true
         boundsBehavior: Flickable.StopAtBounds
-        interactive: contentHeight > height
+        interactive: contentHeight > height + 0.5
 
-        Column {
-          id: column
-          width: scroll.width
-          spacing: Style.space(12)
+        function showProfiles() {
+          if (!root.cursorActive || !interactive) return
+          var bottom = profileRow.mapToItem(column, 0, profileRow.height).y
+          if (bottom > contentY + height) contentY = Math.min(contentHeight - height, bottom - height)
+        }
 
-          // ---------- Hero ----------
-          Item {
-            width: parent.width
-            implicitHeight: Math.max(heroLabels.implicitHeight, heroPercent.implicitHeight)
+        Connections {
+          target: root
+          function onCursorActiveChanged() { scroller.showProfiles() }
+        }
+      // END LOCAL CHANGE
+      Column {
+        id: column
+        anchors.left: parent.left
+        anchors.right: parent.right
+        anchors.top: parent.top
+        spacing: Style.space(14)
 
-            Column {
-              id: heroLabels
-              anchors.left: parent.left
-              anchors.right: heroPercent.left
-              anchors.rightMargin: Style.space(10)
-              anchors.verticalCenter: parent.verticalCenter
-              spacing: Style.space(2)
+        // ---------- Hero: battery icon · title/status · percentage ----------
+        Item {
+          width: parent.width
+          implicitHeight: Math.max(heroIcon.implicitHeight, heroLabels.implicitHeight, heroPercent.implicitHeight)
 
-              Text {
-                text: "Battery"
-                textFormat: Text.PlainText
-                color: root.bar.foreground
-                font.family: root.bar.fontFamily
-                font.pixelSize: Style.font.title
-                font.bold: true
-              }
+          Text {
+            id: heroIcon
+            textFormat: Text.PlainText
+            text: root.batteryIcon()
+            color: root.bar.foreground
+            font.family: root.bar.fontFamily
+            font.pixelSize: Style.font.display
+            anchors.left: parent.left
+            anchors.verticalCenter: parent.verticalCenter
 
-              Text {
-                text: root.statusText.toUpperCase()
-                textFormat: Text.PlainText
-                color: Qt.darker(root.bar.foreground, 1.4)
-                font.family: root.bar.fontFamily
-                font.pixelSize: Style.font.caption
-                font.bold: true
-                font.letterSpacing: 1.2
-                elide: Text.ElideRight
-                width: parent.width
-              }
-            }
+            Behavior on color { ColorAnimation { duration: Style.duration(200) } }
+          }
+
+          Column {
+            id: heroLabels
+            anchors.left: heroIcon.right
+            anchors.leftMargin: Style.space(14)
+            anchors.right: heroPercent.left
+            anchors.rightMargin: Style.space(10)
+            anchors.verticalCenter: parent.verticalCenter
+            spacing: Style.space(2)
 
             Text {
-              id: heroPercent
-              anchors.right: parent.right
-              anchors.verticalCenter: parent.verticalCenter
-              text: Math.round(root.percent) + "%"
+              text: Commons.I18n.t("power.battery")
               textFormat: Text.PlainText
               color: root.bar.foreground
               font.family: root.bar.fontFamily
-              font.pixelSize: Style.font.displayLarge
+              font.pixelSize: Style.font.title
               font.bold: true
+              elide: Text.ElideRight
+              width: parent.width
             }
-          }
 
-          ButtonGroup {
-            options: root.rangeOptions
-            value: root.range
-            focusable: false
-            foreground: root.bar.foreground
-            fontFamily: root.bar.fontFamily
-            fontSize: Style.font.bodySmall
-            onChanged: function(value) { root.setRange(value) }
-          }
-
-          // ---------- Battery level ----------
-          SectionRow {
-            title: "BATTERY LEVEL"
-            detail: levelChart.readout
-          }
-
-          LevelChart {
-            id: levelChart
-            width: parent.width
-            height: Style.space(112)
-            report: root.report
-            foreground: root.bar.foreground
-            accent: root.chargeColor
-            fontFamily: root.bar.fontFamily
-          }
-
-          // ---------- Usage ----------
-          SectionRow {
-            title: root.report && root.report.unit === "hour" ? "USAGE PER HOUR" : "USAGE PER DAY"
-            detail: usageChart.readout
-            legend: usageChart.readout === ""
-          }
-
-          UsageChart {
-            id: usageChart
-            width: parent.width
-            height: Style.space(76)
-            report: root.report
-            foreground: root.bar.foreground
-            fontFamily: root.bar.fontFamily
+            Text {
+              id: heroStatus
+              textFormat: Text.PlainText
+              text: root.heroStatusText.toUpperCase()
+              color: Qt.darker(root.bar.foreground, 1.4)
+              font.family: root.bar.fontFamily
+              font.pixelSize: Style.font.caption
+              font.bold: true
+              font.letterSpacing: 1.2
+              elide: Text.ElideRight
+              width: parent.width
+            }
           }
 
           Text {
-            visible: !!root.report && !root.report.hasData
-            width: parent.width
-            wrapMode: Text.WordWrap
-            text: "No readings in this range yet. The log fills in once a minute while the widget is in your bar."
+            id: heroPercent
             textFormat: Text.PlainText
+            text: root.reading(root.batteryInfo.percentage) || "—"
             color: root.bar.foreground
-            opacity: 0.6
             font.family: root.bar.fontFamily
-            font.pixelSize: Style.font.bodySmall
+            font.pixelSize: Style.font.displayLarge
+            font.bold: true
+            anchors.right: parent.right
+            anchors.verticalCenter: parent.verticalCenter
+
+            Behavior on color { ColorAnimation { duration: Style.duration(200) } }
+          }
+        }
+
+        // ---------- Battery progress bar ----------
+        Item {
+          width: parent.width
+          implicitHeight: Style.space(8)
+
+          Rectangle {
+            id: barTrack
+            anchors.fill: parent
+            radius: height / 2
+            color: Qt.rgba(root.bar.foreground.r, root.bar.foreground.g, root.bar.foreground.b, 0.12)
           }
 
-          // ---------- Range stats ----------
-          Grid {
-            visible: !!root.report
-            width: parent.width
-            columns: 2
-            columnSpacing: Style.space(20)
-            rowSpacing: Style.spacing.labelGap
-            readonly property real cellWidth: (width - columnSpacing) / 2
+          Rectangle {
+            id: barFill
+            anchors.left: barTrack.left
+            anchors.verticalCenter: barTrack.verticalCenter
+            height: barTrack.height
+            radius: barTrack.radius
+            color: root.batteryFillColor
+            width: Math.max(barTrack.height, barTrack.width * root.batteryFraction)
 
-            Stat {
-              width: parent.cellWidth
-              label: "On battery"
-              value: root.report ? Model.formatDuration(root.report.totals.batterySec) : "—"
-            }
-            Stat {
-              width: parent.cellWidth
-              label: "Used"
-              value: root.report ? Math.round(root.report.totals.awake + root.report.totals.sleep) + "% · "
-                + (root.report.totals.awakeWh + root.report.totals.sleepWh).toFixed(1) + " Wh" : "—"
-            }
-            Stat {
-              width: parent.cellWidth
-              label: "Avg drain"
-              value: root.report && root.report.drainW !== null
-                ? root.report.drainW.toFixed(1) + " W · " + root.report.drainPctH.toFixed(1) + "%/h" : "—"
-            }
-            Stat {
-              width: parent.cellWidth
-              label: "Full charge lasts"
-              value: root.report && root.report.runtimeH !== null ? "~" + Model.formatHours(root.report.runtimeH) : "—"
-            }
-            Stat {
-              width: parent.cellWidth
-              label: "Sleep drain"
-              value: root.report && root.report.sleepPctH !== null ? root.report.sleepPctH.toFixed(2) + "%/h" : "—"
-            }
-            Stat {
-              width: parent.cellWidth
-              label: "Last charged"
-              value: {
-                var c = root.report ? root.report.lastCharge : null
-                if (!c) return "—"
-                if (c.charging) return "Charging now"
-                return Math.round(c.p) + "% · " + Model.formatWhen(c.t, root.report.now)
-              }
+            Behavior on width { NumberAnimation { duration: Style.duration(320); easing.type: Easing.OutCubic } }
+            Behavior on color { ColorAnimation { duration: Style.duration(220) } }
+
+            // Subtle pulse while charging — visible signal that energy is flowing in.
+            SequentialAnimation on opacity {
+              running: root.charging && !root.fullyCharged && root.opened && !Style.reduceMotion
+              loops: Animation.Infinite
+              alwaysRunToEnd: true
+              NumberAnimation { from: 1.0; to: 0.55; duration: Style.duration(950); easing.type: Easing.InOutSine }
+              NumberAnimation { from: 0.55; to: 1.0; duration: Style.duration(950); easing.type: Easing.InOutSine }
             }
           }
+        }
 
-          PanelSeparator {
+        // ---------- Stats ----------
+        // Visibility is intentionally only gated by "we've ever loaded data" so
+        // the section never collapses mid-transition. fullyCharged is *not* part
+        // of the condition: UPower briefly reports FullyCharged on plug-in when
+        // the battery sits above the charge-control start threshold, and we
+        // refuse to flicker the whole panel for that ~1s window.
+        Row {
+          visible: root.batteryInfo.percentage !== undefined
+          width: parent.width
+          spacing: Style.space(20)
+
+          Column {
+            width: (parent.width - parent.spacing) / 2
+            spacing: Style.spacing.labelGap
+            InfoPair { label: Commons.I18n.t("power.batterySize"); value: root.reading(root.batteryInfo.size) }
+            InfoPair { label: Commons.I18n.t("power.chargeCycles"); value: root.reading(root.batteryInfo.cycles) || "—" }
+          }
+
+          Column {
+            width: (parent.width - parent.spacing) / 2
+            spacing: Style.spacing.labelGap
+            InfoPair {
+              label: root.chargeThresholdActive ? Commons.I18n.t("power.chargeLimit") : (root.discharging ? Commons.I18n.t("power.timeLeft") : Commons.I18n.t("power.timeToFull"))
+              value: root.chargeThresholdActive ? (root.reading(root.batteryInfo.threshold) || "-") : (root.batteryFlowIdle ? "-" : (root.batteryInfo.time || "—"))
+            }
+            InfoPair {
+              label: root.chargeThresholdActive ? Commons.I18n.t("power.batteryState") : (root.discharging ? Commons.I18n.t("power.discharging") : Commons.I18n.t("power.charging"))
+              value: root.chargeThresholdActive ? Commons.I18n.t("power.holding") : (root.batteryFull ? "-" : root.reading(root.batteryInfo.rate))
+            }
+          }
+        }
+
+        // LOCAL CHANGE: HISTORY section, between the stats and the power
+        // profiles. The choice is the widget's (persisted in ui.json); the
+        // section only shows it and reports picks.
+        PanelSeparator {
+          foreground: root.bar.foreground
+        }
+
+        HistorySection {
+          id: history
+          width: parent.width
+          active: root.opened
+          graph: root.graph
+          range: root.range
+          stateDir: root.stateDir
+          helper: root.helper
+          service: root.bar && root.bar.shell && typeof root.bar.shell.serviceFor === "function"
+            ? root.bar.shell.serviceFor(root.moduleName) : null
+          foreground: root.bar.foreground
+          fontFamily: root.bar.fontFamily
+          onGraphPicked: function(value) { root.setGraph(value) }
+          onRangePicked: function(value) { root.setRange(value) }
+          onPickerClosed: keyCatcher.forceActiveFocus()
+        }
+        // END LOCAL CHANGE
+        // ---------- Power profile picker ----------
+        PanelSeparator {
+          foreground: root.bar.foreground
+        }
+
+        Column {
+          width: parent.width
+          spacing: Style.space(10)
+
+          PanelSectionHeader {
+            text: Commons.I18n.t("power.powerProfile")
             foreground: root.bar.foreground
-          }
-
-          // ---------- Health ----------
-          SectionRow {
-            title: "BATTERY HEALTH"
-            detail: root.health ? root.health.condition : ""
-            detailColor: root.health && root.health.capacity < Model.HEALTH_SERVICE_THRESHOLD ? Color.urgent : root.bar.foreground
-          }
-
-          Item {
-            visible: !!root.health
-            width: parent.width
-            implicitHeight: Math.max(capacityValue.implicitHeight, capacityLabels.implicitHeight)
-
-            Text {
-              id: capacityValue
-              anchors.left: parent.left
-              anchors.verticalCenter: parent.verticalCenter
-              text: root.health ? Model.formatPercent(root.health.capacity, 1) : ""
-              textFormat: Text.PlainText
-              color: root.bar.foreground
-              font.family: root.bar.fontFamily
-              font.pixelSize: Style.font.display
-              font.bold: true
-            }
-
-            Column {
-              id: capacityLabels
-              anchors.left: capacityValue.right
-              anchors.leftMargin: Style.space(12)
-              anchors.right: parent.right
-              anchors.verticalCenter: parent.verticalCenter
-              spacing: Style.space(1)
-
-              Text {
-                text: "Maximum capacity"
-                textFormat: Text.PlainText
-                color: root.bar.foreground
-                font.family: root.bar.fontFamily
-                font.pixelSize: Style.font.bodySmall
-              }
-              Text {
-                text: root.health ? root.health.fullWh.toFixed(1) + " of " + root.health.designWh.toFixed(1)
-                  + " Wh design · " + Model.formatPercent(root.health.loss, 1) + " lost" : ""
-                textFormat: Text.PlainText
-                color: root.bar.foreground
-                opacity: 0.6
-                font.family: root.bar.fontFamily
-                font.pixelSize: Style.font.caption
-                elide: Text.ElideRight
-                width: parent.width
-              }
-            }
-          }
-
-          HealthChart {
-            visible: !!root.health
-            width: parent.width
-            height: Style.space(84)
-            health: root.health
-            nowSec: root.report ? root.report.now : Date.now() / 1000
-            foreground: root.bar.foreground
-            accent: Color.accent
-            warning: Color.urgent
             fontFamily: root.bar.fontFamily
           }
 
-          Grid {
-            visible: !!root.health
+          Row {
+            id: profileRow
             width: parent.width
-            columns: 2
-            columnSpacing: Style.space(20)
-            rowSpacing: Style.spacing.labelGap
-            readonly property real cellWidth: (width - columnSpacing) / 2
+            spacing: Style.space(6)
 
-            Stat {
-              width: parent.cellWidth
-              label: "Cycle count"
-              value: root.health && root.health.cycles > 0 ? String(root.health.cycles) : "—"
-            }
-            Stat {
-              width: parent.cellWidth
-              label: "Battery age"
-              value: root.health ? Model.formatYears(root.health.ageYears) : "—"
-            }
-            Stat {
-              width: parent.cellWidth
-              label: "Loss per 100 cycles"
-              value: root.health ? Model.formatPercent(root.health.per100Cycles, 1) : "—"
-            }
-            Stat {
-              width: parent.cellWidth
-              label: "Loss per year"
-              value: root.health ? Model.formatPercent(root.health.perYear, 1) : "—"
-            }
-            Stat {
-              width: parent.cellWidth
-              label: "Measured trend"
-              value: {
-                var h = root.health
-                if (!h) return "—"
-                if (h.trend) return "−" + h.trend.perYear.toFixed(1) + "%/yr"
-                return "tracking " + Math.min(h.trackedDays, Model.TREND_MIN_DAYS) + "/" + Model.TREND_MIN_DAYS + " d"
-              }
-            }
-            Stat {
-              width: parent.cellWidth
-              label: "Reaches 80%"
-              value: {
-                var h = root.health
-                if (!h) return "—"
-                if (h.capacity < Model.HEALTH_SERVICE_THRESHOLD) return "already below"
-                return h.yearsTo80 !== null ? "in ~" + Model.formatYears(h.yearsTo80) : "—"
+            readonly property real cellWidth: root.profiles.length > 0
+              ? (width - spacing * (root.profiles.length - 1)) / root.profiles.length
+              : 0
+
+            Repeater {
+              model: root.profiles
+              Button {
+                required property var modelData
+                required property int index
+                width: profileRow.cellWidth
+                iconText: root.profileIcon(String(modelData))
+                iconSize: Style.font.title
+                text: Model.profileLabel(modelData, Commons.I18n.t)
+                fontSize: Style.font.bodySmall
+                foreground: root.bar.foreground
+                fontFamily: root.bar.fontFamily
+                horizontalPadding: Style.spacing.controlPaddingX
+                verticalPadding: Style.spacing.controlPaddingY + Style.space(2)
+                bordered: true
+                active: root.activeProfile === modelData
+                hasCursor: root.cursorActive && root.profileIndex === index
+                onClicked: root.setProfile(modelData)
+                onHovered: function(h) {
+                  if (h) {
+                    root.cursorActive = true
+                    root.profileIndex = index
+                  }
+                }
               }
             }
           }
         }
       }
+      // LOCAL CHANGE: end of the scrolling area
+      }
+      // END LOCAL CHANGE
     }
   }
 
-  // Section title with a right-aligned detail: a chart's hover readout, or
-  // the usage legend when nothing is hovered.
-  component SectionRow: Item {
-    property string title: ""
-    property string detail: ""
-    property bool legend: false
-    property color detailColor: root.bar.foreground
-
-    width: parent.width
-    implicitHeight: header.implicitHeight
-
-    PanelSectionHeader {
-      id: header
-      text: parent.title
-      foreground: root.bar.foreground
-      fontFamily: root.bar.fontFamily
-    }
-
-    Text {
-      visible: !parent.legend && parent.detail !== ""
-      anchors.right: parent.right
-      anchors.baseline: header.baseline
-      width: Math.min(implicitWidth, parent.width - header.implicitWidth - Style.space(12))
-      horizontalAlignment: Text.AlignRight
-      elide: Text.ElideLeft
-      text: parent.detail
-      textFormat: Text.PlainText
-      color: parent.detailColor
-      opacity: 0.8
-      font.family: root.bar.fontFamily
-      font.pixelSize: Style.font.caption
-    }
-
-    Row {
-      visible: parent.legend
-      anchors.right: parent.right
-      anchors.verticalCenter: header.verticalCenter
-      spacing: Style.space(10)
-
-      LegendKey { label: "Awake"; swatchOpacity: 0.9 }
-      LegendKey { label: "Asleep"; swatchOpacity: 0.3 }
-    }
-  }
-
-  component LegendKey: Row {
-    property string label: ""
-    property real swatchOpacity: 1
-    spacing: Style.space(4)
-
-    Rectangle {
-      width: Style.space(8)
-      height: Style.space(8)
-      anchors.verticalCenter: parent.verticalCenter
-      color: root.bar.foreground
-      opacity: parent.swatchOpacity
-    }
-    Text {
-      text: parent.label
-      textFormat: Text.PlainText
-      color: root.bar.foreground
-      opacity: 0.6
-      font.family: root.bar.fontFamily
-      font.pixelSize: Style.font.caption
-    }
-  }
-
-  component Stat: Item {
+  component InfoPair: Row {
     property string label: ""
     property string value: ""
-    implicitHeight: Math.max(statLabel.implicitHeight, statValue.implicitHeight)
 
-    Text {
-      id: statLabel
-      anchors.left: parent.left
-      text: parent.label
-      textFormat: Text.PlainText
-      color: root.bar.foreground
-      opacity: 0.6
-      font.family: root.bar.fontFamily
-      font.pixelSize: Style.font.bodySmall
-    }
-    Text {
-      id: statValue
-      anchors.right: parent.right
-      anchors.left: statLabel.right
-      anchors.leftMargin: Style.space(8)
-      horizontalAlignment: Text.AlignRight
-      elide: Text.ElideRight
-      text: parent.value
-      textFormat: Text.PlainText
-      color: root.bar.foreground
-      font.family: root.bar.fontFamily
-      font.pixelSize: Style.font.bodySmall
-    }
+    width: parent.width
+    spacing: Style.space(8)
+
+    InfoLabel { text: label }
+    Item { width: Math.max(0, parent.width - parent.children[0].implicitWidth - parent.children[2].implicitWidth - parent.spacing * 2); height: 1 }
+    InfoValue { text: value }
+  }
+
+  component InfoLabel: Text {
+    textFormat: Text.PlainText
+    color: root.bar.foreground
+    opacity: 0.6
+    font.family: root.bar.fontFamily
+    font.pixelSize: Style.font.bodySmall
+  }
+
+  component InfoValue: Text {
+    textFormat: Text.PlainText
+    color: root.bar.foreground
+    font.family: root.bar.fontFamily
+    font.pixelSize: Style.font.bodySmall
   }
 }
