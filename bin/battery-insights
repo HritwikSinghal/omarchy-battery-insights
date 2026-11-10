@@ -5,6 +5,11 @@
 #
 #   battery-insights sample [--backfill]   append one reading (and a daily health row)
 #   battery-insights info                  print battery facts as key=value
+#   battery-insights stock-check [--notify-once]
+#                                          has Omarchy changed the power panel files
+#                                          this plugin copied? (exit 0 same, 3 changed,
+#                                          4 not installed)
+#   battery-insights stock-ack FINGERPRINT mark that stock version as announced
 #
 # Readings come from UPower, so any laptop battery works the same way.
 # Logs live in ${XDG_STATE_HOME:-~/.local/state}/battery-insights/:
@@ -57,14 +62,26 @@ state_letter() {
   esac
 }
 
+# Times of the first and last readings in the log, skipping any line that is
+# not a reading (a torn write, a hand edit). Only digits come out of these, so
+# no line of the log ever reaches bash arithmetic, where `a[$(cmd)]` would run.
+first_sample_t() {
+  awk -F, '$1 ~ /^[0-9]+$/ { print $1; exit }' "$SAMPLES" 2>/dev/null
+}
+
+last_sample_t() {
+  awk -F, '$1 ~ /^[0-9]+$/ { t = $1 } END { if (t != "") print t }' "$SAMPLES" 2>/dev/null
+}
+
 prune_samples() {
   local now=$1 first
-  first=$(head -n1 "$SAMPLES" 2>/dev/null | cut -d, -f1)
+  first=$(first_sample_t)
   [[ $first =~ ^[0-9]+$ ]] || return 0
   # Only rewrite once the oldest row is a day past the window, so this runs
-  # about once a day rather than every minute.
+  # about once a day rather than every minute. Lines that are not readings go
+  # too; the numeric test keeps awk from comparing "x,..." as a string.
   ((first < now - (KEEP_DAYS + 1) * 86400)) || return 0
-  awk -F, -v cutoff=$((now - KEEP_DAYS * 86400)) '$1 >= cutoff' "$SAMPLES" >"$SAMPLES.tmp" && mv "$SAMPLES.tmp" "$SAMPLES"
+  awk -F, -v cutoff=$((now - KEEP_DAYS * 86400)) '$1 ~ /^[0-9]+$/ && $1 + 0 >= cutoff' "$SAMPLES" >"$SAMPLES.tmp" && mv "$SAMPLES.tmp" "$SAMPLES"
 }
 
 record_health() {
@@ -80,7 +97,14 @@ record_health() {
 # has charts right away and a shell restart leaves no hole.
 backfill() {
   local device=$1 full=$2 first=0 last=0
-  [[ -s $SAMPLES ]] && first=$(head -n1 "$SAMPLES" | cut -d, -f1) && last=$(tail -n1 "$SAMPLES" | cut -d, -f1)
+  # A junk first or last line must not read as "nothing logged": that would
+  # replace the whole log with UPower's week of history below.
+  if [[ -s $SAMPLES ]]; then
+    first=$(first_sample_t)
+    last=$(last_sample_t)
+    [[ $first =~ ^[0-9]+$ ]] || first=0
+    [[ $last =~ ^[0-9]+$ ]] || last=0
+  fi
 
   local history
   history=$(
@@ -143,8 +167,15 @@ cmd_sample() {
 
   [[ ${1:-} == --backfill ]] && backfill "$device" "${v[energy-full]}"
 
-  printf '%d,%.2f,%.3f,%.3f,%.2f,%s\n' "$now" "${v[percentage]:-0}" "${v[energy]:-0}" \
-    "${v[energy-full]:-0}" "${v[energy-rate]:-0}" "$(state_letter "${v[state]}")" >>"$SAMPLES"
+  # A reading UPower could not give (mid-restart, a device going away) is
+  # skipped: logged as 0% it would read as most of the battery used and drop
+  # the level line to zero.
+  if [[ ${v[percentage]:-} =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+    printf '%d,%.2f,%.3f,%.3f,%.2f,%s\n' "$now" "${v[percentage]}" "${v[energy]:-0}" \
+      "${v[energy-full]:-0}" "${v[energy-rate]:-0}" "$(state_letter "${v[state]}")" >>"$SAMPLES"
+  else
+    echo "battery-insights: UPower gave no battery reading; skipped this sample" >&2
+  fi
 
   local today
   printf -v today '%(%F)T' -1
@@ -181,11 +212,101 @@ cmd_info() {
   fi
 }
 
+# Widget.qml is built on Omarchy's power panel and PowerModel.js is its model,
+# copied byte for byte; stock/omarchy-power.sha256 records their hashes at copy
+# time. When Omarchy ships a new version, the copy is stale until re-synced, so
+# say so: once per new stock version with --notify-once (the service asks at
+# shell start and notifies on notify=1), every time without it (test/run.sh).
+OMARCHY_ROOT=${BATTERY_INSIGHTS_OMARCHY_ROOT:-${OMARCHY_PATH:-/usr/share/omarchy}}
+STOCK_DIR=${BATTERY_INSIGHTS_STOCK_DIR:-$OMARCHY_ROOT/shell/plugins/panels/power}
+STOCK_SUMS=${BATTERY_INSIGHTS_STOCK_SUMS:-$(dirname "$(readlink -f "$0")")/../stock/omarchy-power.sha256}
+
+cmd_stock_check() {
+  local notify_once=0
+  [[ ${1:-} == --notify-once ]] && notify_once=1
+
+  [[ -r $STOCK_SUMS ]] || { echo "battery-insights: no recorded stock hashes at $STOCK_SUMS" >&2; return 1; }
+
+  # Read the recorded hashes first. A short, empty or garbled sums file is an
+  # error, never a silent "same"; a last line without a newline and CRLF line
+  # ends still count.
+  local line
+  local -a names=() hashes=()
+  while IFS= read -r line || [[ -n $line ]]; do
+    line=${line%$'\r'}
+    [[ -n $line ]] || continue
+    if [[ $line =~ ^([0-9a-f]{64})\ \ (.+)$ ]]; then
+      hashes+=("${BASH_REMATCH[1]}")
+      names+=("${BASH_REMATCH[2]}")
+    else
+      echo "battery-insights: malformed line in $STOCK_SUMS: $line" >&2
+      return 1
+    fi
+  done <"$STOCK_SUMS"
+  ((${#names[@]} > 0)) || { echo "battery-insights: no recorded stock hashes in $STOCK_SUMS" >&2; return 1; }
+
+  # Only a machine without Omarchy has nothing to compare. A file (or the
+  # whole panel directory) missing from an installed Omarchy is a change to
+  # re-sync, not a reason to stay quiet.
+  if [[ ! -d $OMARCHY_ROOT/shell ]]; then
+    echo "status=absent"
+    return 4
+  fi
+
+  local i current
+  local -a changed=() currents=()
+  for i in "${!names[@]}"; do
+    if [[ -r $STOCK_DIR/${names[i]} ]]; then
+      current=$(sha256sum "$STOCK_DIR/${names[i]}" | cut -d' ' -f1)
+    else
+      current=missing
+    fi
+    currents+=("${names[i]}:$current")
+    [[ $current == "${hashes[i]}" ]] || changed+=("${names[i]}")
+  done
+
+  if ((${#changed[@]} == 0)); then
+    echo "status=same"
+    return 0
+  fi
+
+  echo "status=changed"
+  (IFS=,; echo "changed=${changed[*]}")
+
+  if ((notify_once)); then
+    # One fingerprint per combination of stock versions: a later Omarchy
+    # update notifies again, a restart on the same version does not.
+    local fingerprint ack=$STATE_DIR/stock-ack previous=""
+    fingerprint=$(printf '%s\n' "${currents[@]}" | sha256sum | cut -d' ' -f1)
+    [[ -r $ack ]] && previous=$(<"$ack")
+    if [[ $previous == "$fingerprint" ]]; then
+      echo "notify=0"
+    else
+      # Not marked as announced here: the service runs `stock-ack` once the
+      # notification has really gone out, so a send that fails (say, before
+      # the notification daemon is up) is tried again at the next start.
+      echo "notify=1"
+      echo "fingerprint=$fingerprint"
+    fi
+  fi
+  return 3
+}
+
+cmd_stock_ack() {
+  local fingerprint=${1:-}
+  [[ $fingerprint =~ ^[0-9a-f]{64}$ ]] || { echo "battery-insights: stock-ack takes the fingerprint stock-check printed" >&2; return 1; }
+  mkdir -p "$STATE_DIR" &&
+    echo "$fingerprint" >"$STATE_DIR/stock-ack.tmp" &&
+    mv "$STATE_DIR/stock-ack.tmp" "$STATE_DIR/stock-ack"
+}
+
 case "${1:-}" in
   sample) shift; cmd_sample "$@" ;;
   info) cmd_info ;;
+  stock-check) shift; cmd_stock_check "$@"; exit $? ;;
+  stock-ack) shift; cmd_stock_ack "$@"; exit $? ;;
   *)
-    echo "Usage: battery-insights sample [--backfill] | info" >&2
+    echo "Usage: battery-insights sample [--backfill] | info | stock-check [--notify-once] | stock-ack FINGERPRINT" >&2
     exit 1
     ;;
 esac
