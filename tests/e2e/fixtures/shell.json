@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "bar": {
+    "layout": {
+      "left": [],
+      "centerBegin": [],
+      "center": [],
+      "centerEnd": [],
+      "right": [{ "id": "hritwiksinghal.battery-insights", "showPercentage": true }]
+    }
+  },
+  "plugins": [],
+  "disabledPlugins": ["omarchy.lock", "omarchy.idle", "omarchy.battery", "omarchy.power"],
+  "cloneSourceRestores": ["hritwiksinghal.battery-insights"]
+}
