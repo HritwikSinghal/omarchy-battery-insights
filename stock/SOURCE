@@ -1,0 +1,3 @@
+# Omarchy files this plugin copies. Hashes: omarchy-power.sha256 (checked by bin/battery-insights stock-check).
+Panel.qml  /usr/share/omarchy/shell/plugins/panels/power/Panel.qml  omarchy 4.0.0.r7637.g29f3bb6  copied 2026-11-10  -> base of Widget.qml (LOCAL CHANGE hunks)
+Model.js   /usr/share/omarchy/shell/plugins/panels/power/Model.js   omarchy 4.0.0.r7637.g29f3bb6  copied 2026-11-10  -> PowerModel.js (verbatim)

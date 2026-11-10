@@ -1,10 +1,10 @@
 {
   "schemaVersion": 1,
-  "id": "aabulkhairov.battery-insights",
+  "id": "hritwiksinghal.battery-insights",
   "name": "Battery Insights",
-  "version": "0.1.0",
-  "author": "aabulkhairov",
-  "description": "Battery level, discharge rate and health history, macOS-style",
+  "version": "1.0.0",
+  "author": "HritwikSinghal",
+  "description": "Omarchy's battery panel with battery level, usage and health history",
   "kinds": [
     "service",
     "bar-widget"
@@ -13,18 +13,21 @@
     "service": "Service.qml",
     "barWidget": "Widget.qml"
   },
+  "omarchy": {
+    "clonedFrom": "omarchy.power"
+  },
   "barWidget": {
     "displayName": "Battery Insights",
-    "description": "Battery level and usage for the last 24 hours, 7 or 30 days, plus battery health",
+    "description": "The battery panel plus battery level, usage and health history",
     "category": "System",
     "allowMultiple": false,
     "defaultSection": "right",
     "schema": [
       {
-        "key": "showRate",
+        "key": "showPercentage",
         "type": "boolean",
-        "label": "Show power draw",
-        "description": "Show the current discharge rate in watts next to the icon while on battery.",
+        "label": "Show percentage",
+        "description": "Show the battery percentage next to the icon.",
         "defaultValue": false
       }
     ]
