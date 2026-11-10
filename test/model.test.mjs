@@ -30,10 +30,27 @@ function near(actual, expected, tolerance = 0.01) {
 }
 
 test("parseSamples keeps the later of two same-second rows and skips junk", () => {
-  const rows = Model.parseSamples("100,50,20,40,4,D\n100,49,19.6,40,4,D\n90,48,1,1,1,D\nbad\n160,48,19.2,40,4,D\n")
+  const rows = Model.parseSamples("100,50,20,40,4,D\n100,49,19.6,40,4,D\nbad\n160,48,19.2,40,4,D\n")
   assert.equal(rows.length, 2)
   assert.equal(rows[0].p, 49)
   assert.equal(rows[1].t, 160)
+})
+
+// A clock that ran ahead and was then pulled back (no network time yet at
+// boot, an RTC kept in local time) leaves one row dated after the rows that
+// follow it. It must not hide them.
+test("parseSamples sorts an out-of-order row in instead of dropping what follows it", () => {
+  const rows = Model.parseSamples("100,50,1,1,1,D\n99999,49,1,1,1,D\n160,48,1,1,1,D\n220,47,1,1,1,D\n")
+  assert.deepEqual(JSON.parse(JSON.stringify(rows.map((r) => r.t))), [100, 160, 220, 99999])
+  assert.deepEqual(JSON.parse(JSON.stringify(rows.map((r) => r.p))), [50, 48, 47, 49])
+})
+
+test("buildReport ignores readings dated after now", () => {
+  const now = MIDNIGHT + 15 * HOUR
+  const samples = [...run(now - 3 * HOUR, 120, 80, -0.1, "D"), sample(now + 5 * HOUR, 95, "C")]
+  const report = Model.buildReport(samples, "24h", now)
+  // Only the future row charges; without it there is no charge in range.
+  assert.equal(report.lastCharge, null)
 })
 
 test("daily buckets are contiguous, midnight-aligned, and end with today", () => {
@@ -127,10 +144,36 @@ test("measured trend needs two weeks, then fits the slope", () => {
   assert.equal(Model.measuredTrend(history.slice(0, 10)), null)
 })
 
+test("trendWaiting says what the measured trend still needs, never 14 of 14 days without a trend", () => {
+  const day = 86400
+  const t0 = Model.dateToEpoch("2026-08-01")
+  const daily = (count, every = 1) => Array.from({ length: count }, (_, i) => ({ t: t0 + i * every * day, capacity: 90 }))
+  // 14 rows a day apart span 13 days: still waiting, and it says 13, not 14.
+  assert.equal(Model.measuredTrend(daily(14)), null)
+  assert.deepEqual(JSON.parse(JSON.stringify(Model.trendWaiting(daily(14)))), { what: "days", have: 13, need: 14 })
+  // 15 rows span 14 days: the trend exists and nothing is waiting.
+  assert.notEqual(Model.measuredTrend(daily(15)), null)
+  assert.equal(Model.trendWaiting(daily(15)), null)
+  // 6 rows over 30 days: the span is there, the readings are not.
+  assert.equal(Model.measuredTrend(daily(6, 6)), null)
+  assert.deepEqual(JSON.parse(JSON.stringify(Model.trendWaiting(daily(6, 6)))), { what: "readings", have: 6, need: 7 })
+  assert.deepEqual(JSON.parse(JSON.stringify(Model.trendWaiting([]))), { what: "days", have: 0, need: 14 })
+})
+
+test("formatTrend signs a loss with a minus and a gain with a plus, once", () => {
+  assert.equal(Model.formatTrend(3.94), "\u22123.9")
+  assert.equal(Model.formatTrend(-53.2), "+53.2")
+  assert.equal(Model.formatTrend(0.04), "0.0")
+  assert.equal(Model.formatTrend(-0.04), "0.0")
+})
+
 test("formatting helpers", () => {
   assert.equal(Model.formatDuration(5 * HOUR + 7 * 60), "5h 07m")
   assert.equal(Model.formatDuration(59), "1m")
   assert.equal(Model.formatYears(0.5), "6 months")
+  assert.equal(Model.formatYears(0.05), "1 month")
+  assert.equal(Model.formatYears(0.97), "1.0 years")
+  assert.equal(Model.formatYears(2.34), "2.3 years")
   assert.equal(Model.formatWhen(MIDNIGHT + 14 * HOUR + 32 * 60, MIDNIGHT + 20 * HOUR), "Today 14:32")
   assert.equal(Model.formatWhen(MIDNIGHT - HOUR, MIDNIGHT + 20 * HOUR), "Yesterday 23:00")
 })

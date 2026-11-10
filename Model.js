@@ -23,21 +23,27 @@ var HEALTH_SERVICE_THRESHOLD = 80
 // ---------------------------------------------------------------- parsing
 
 function parseSamples(text) {
-  var out = []
+  var rows = []
   var lines = String(text || "").split("\n")
-  var lastT = -1
   for (var i = 0; i < lines.length; i++) {
     var f = lines[i].split(",")
     if (f.length < 6) continue
     var t = Number(f[0])
     var p = Number(f[1])
     if (!isFinite(t) || !isFinite(p)) continue
+    rows.push({ t: t, p: p, e: Number(f[2]) || 0, f: Number(f[3]) || 0, w: Number(f[4]) || 0, s: f[5].trim(), i: i })
+  }
+  // Rows are appended in time order, but a clock that ran ahead and was then
+  // pulled back leaves a row dated after the ones that follow it; sorting
+  // keeps every reading instead of dropping all those "older" ones.
+  rows.sort(function(a, b) { return a.t - b.t || a.i - b.i })
+  var out = []
+  for (var k = 0; k < rows.length; k++) {
+    var r = rows[k]
     // Rows share a timestamp when a sample lands in the same second as a
     // state-change sample; the later row wins.
-    if (t === lastT) out.pop()
-    else if (t < lastT) continue
-    out.push({ t: t, p: p, e: Number(f[2]) || 0, f: Number(f[3]) || 0, w: Number(f[4]) || 0, s: f[5].trim() })
-    lastT = t
+    if (out.length && out[out.length - 1].t === r.t) out.pop()
+    out.push({ t: r.t, p: r.p, e: r.e, f: r.f, w: r.w, s: r.s })
   }
   return out
 }
@@ -204,6 +210,9 @@ function levelSeries(samples, from, to, step) {
 // ---------------------------------------------------------------- report
 
 function buildReport(samples, rangeKey, nowSec) {
+  // A reading dated after now came from a clock that ran ahead; it is not
+  // the latest reading, whatever its timestamp says.
+  samples = samples.filter(function(s) { return s.t <= nowSec + 60 })
   var range = RANGES[rangeKey] || RANGES["24h"]
   var list = buckets(rangeKey, nowSec)
   accumulate(list, samples)
@@ -331,9 +340,22 @@ function healthReport(info, history, nowSec) {
 // estimate of full capacity wobbles by a percent or so between charges, so
 // this needs two weeks of readings before it says anything.
 var TREND_MIN_DAYS = 14
+var TREND_MIN_READINGS = 7
+
+// What the measured trend is still waiting for, or null once it has enough:
+// { what: "days" | "readings", have, need }. Days count whole days of span,
+// so "14 of 14 days" only shows once the trend itself does.
+function trendWaiting(history) {
+  var n = history.length
+  var spanDays = n ? (history[n - 1].t - history[0].t) / 86400 : 0
+  if (spanDays < TREND_MIN_DAYS)
+    return { what: "days", have: Math.min(Math.floor(spanDays), TREND_MIN_DAYS - 1), need: TREND_MIN_DAYS }
+  if (n < TREND_MIN_READINGS) return { what: "readings", have: n, need: TREND_MIN_READINGS }
+  return null
+}
 
 function measuredTrend(history) {
-  if (history.length < 7) return null
+  if (history.length < TREND_MIN_READINGS) return null
   var spanDays = (history[history.length - 1].t - history[0].t) / 86400
   if (spanDays < TREND_MIN_DAYS) return null
   var n = history.length
@@ -400,6 +422,20 @@ function formatBucketLabel(bucket, unit) {
 
 function formatYears(years) {
   if (years === null || years === undefined || !isFinite(years)) return "—"
-  if (years < 1) return Math.max(1, Math.round(years * 12)) + " months"
-  return years.toFixed(1) + " years"
+  if (years < 1) {
+    var months = Math.max(1, Math.round(years * 12))
+    if (months < 12) return months + (months === 1 ? " month" : " months")
+  }
+  return Math.max(1, years).toFixed(1) + " years"
+}
+
+// Measured capacity trend as a signed figure per year: a loss reads "-3.9"
+// (with a true minus sign), a gain "+1.2". The fuel gauge's estimate wobbles,
+// so a short or noisy history can show a gain; the sign is written here
+// exactly once.
+function formatTrend(perYear) {
+  var v = Math.round(perYear * 10) / 10
+  if (v > 0) return "\u2212" + v.toFixed(1)
+  if (v < 0) return "+" + (-v).toFixed(1)
+  return "0.0"
 }
